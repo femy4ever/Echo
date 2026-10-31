@@ -6,7 +6,7 @@
 
 ECHO is a small stealth-horror game. The screen is pitch black, and the only way to see is to make a noise. Each sonar pulse spreads out, bounces off the walls and comes back as a fading outline of the maze. The creatures in the maze are blind too, and they hunt by sound.
 
-**[Play it here](https://YOUR-USERNAME.github.io/echo/)**
+**[Play it here](https://femy4ever.github.io/Echo/)**
 
 It's all in one HTML file, with no engine, no libraries, and no image or audio files. The maze, the visuals and every sound are generated while you play.
 
@@ -53,11 +53,9 @@ The creatures follow a few simple rules, and the game shows you each one on scre
 
 Download `index.html` and open it in any modern browser. Nothing needs installing.
 
-## Publish on GitHub Pages
+## Play online
 
-1. Push this folder to a new repository (for example `echo`).
-2. In the repository, go to **Settings → Pages** and set the source to the `main` branch, `/ (root)` folder.
-3. After a minute or so, the game will be live at `https://YOUR-USERNAME.github.io/echo/`. Then replace the link at the top of this README with yours.
+ECHO is hosted on GitHub Pages: **https://femy4ever.github.io/Echo/**
 
 ## Project files
 
@@ -66,7 +64,6 @@ index.html                     the whole game
 docs/ECHO-code-explained.pdf   line-by-line guide to the code
 docs/*.png                     screenshots used in this README
 README.md                      this file
-LICENSE                        MIT licence
 CREDITS.md                     who made what
 .gitattributes                 line-ending and language settings for Git and GitHub
 ```
