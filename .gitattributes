@@ -1,0 +1,9 @@
+# Normalise line endings so the files look the same on Windows, macOS and Linux
+* text=auto eol=lf
+
+# Binary files: never change their line endings or try to diff them as text
+*.png binary
+*.pdf binary
+
+# Tell GitHub's language bar that the docs folder is documentation, not code
+docs/** linguist-documentation

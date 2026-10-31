@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECHO</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+let DPR = 1, VW = 0, VH = 0;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  VW = innerWidth; VH = innerHeight;
+  cv.width = VW * DPR; cv.height = VH * DPR;
+  cv.style.width = VW + 'px'; cv.style.height = VH + 'px';
+}
+addEventListener('resize', resize); resize();
+
+const TILE = 40;
+const SOUND = 520;
+const SIGHT = { pulse: 700, click: 170, step: 90 };
+const HEAR = { pulse: 420, click: 110, step: 200 };
+const RAYS = { pulse: 320, click: 140, step: 50 };
+const WALK = 115, RUN = 190, MAX_LIVES = 3;
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const WALL = 1, EXIT = 2, FOE = 3, DIMWALL = 4;
+const COL = { 1: 'hsl(185,100%,65%)', 2: 'hsl(45,100%,60%)', 3: 'hsl(0,100%,62%)', 4: 'hsl(185,60%,50%)' };
+const RED = COL[FOE];
+const FONT = 'ui-monospace, Menlo, Consolas, monospace';
+
+function makeRng(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let r = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    r = r + Math.imul(r ^ r >>> 7, 61 | r) ^ r;
+    return ((r ^ r >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+let G, GW, GH, R, openTiles = [];
+function genMaze(w, h, loops) {
+  G = new Uint8Array(w * h).fill(1); GW = w; GH = h;
+  const stack = [[1, 1]]; G[w + 1] = 0;
+  while (stack.length) {
+    const [x, y] = stack[stack.length - 1];
+    const options = [[2, 0], [-2, 0], [0, 2], [0, -2]].filter(([dx, dy]) => {
+      const nx = x + dx, ny = y + dy;
+      return nx > 0 && ny > 0 && nx < w - 1 && ny < h - 1 && G[ny * w + nx] === 1;
+    });
+    if (!options.length) { stack.pop(); continue; }
+    const [dx, dy] = options[Math.floor(R() * options.length)];
+    G[(y + dy / 2) * w + x + dx / 2] = 0;
+    G[(y + dy) * w + x + dx] = 0;
+    stack.push([x + dx, y + dy]);
+  }
+  for (let i = 0; i < loops; i++) {
+    const x = 1 + Math.floor(R() * (w - 2)), y = 1 + Math.floor(R() * (h - 2)), c = y * w + x;
+    if (G[c] !== 1) continue;
+    const across = G[c - 1] === 0 && G[c + 1] === 0 && G[c - w] && G[c + w];
+    const down = G[c - w] === 0 && G[c + w] === 0 && G[c - 1] && G[c + 1];
+    if (across || down) G[c] = 0;
+  }
+  listOpenTiles();
+}
+function listOpenTiles() {
+  openTiles = [];
+  for (let i = 0; i < G.length; i++) if (!G[i]) openTiles.push(i);
+}
+function loadMap(rows) {
+  GH = rows.length; GW = rows[0].length;
+  G = new Uint8Array(GW * GH);
+  const marks = {};
+  for (let y = 0; y < GH; y++) {
+    for (let x = 0; x < GW; x++) {
+      const ch = rows[y][x];
+      G[y * GW + x] = ch === '#' ? 1 : 0;
+      if (ch !== '#' && ch !== '.') marks[ch] = { tx: x, ty: y };
+    }
+  }
+  listOpenTiles();
+  return marks;
+}
+function solid(tx, ty) { return tx < 0 || ty < 0 || tx >= GW || ty >= GH || G[ty * GW + tx] === 1; }
+const tileOf = v => Math.floor(v / TILE);
+const mid = tile => (tile + 0.5) * TILE;
+
+function bfs(sx, sy) {
+  const dist = new Int32Array(GW * GH).fill(-1), prev = new Int32Array(GW * GH).fill(-1);
+  const queue = [sy * GW + sx]; dist[queue[0]] = 0;
+  for (let head = 0; head < queue.length; head++) {
+    const c = queue[head], x = c % GW, y = (c / GW) | 0;
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy, n = ny * GW + nx;
+      if (nx < 0 || ny < 0 || nx >= GW || ny >= GH || G[n] || dist[n] >= 0) continue;
+      dist[n] = dist[c] + 1; prev[n] = c; queue.push(n);
+    }
+  }
+  return { dist, prev };
+}
+function findPath(sx, sy, tx, ty) {
+  const { prev, dist } = bfs(tx, ty);
+  let c = sy * GW + sx;
+  if (dist[c] < 0) return [];
+  const path = [], goal = ty * GW + tx;
+  while (c !== goal) { c = prev[c]; path.push(c); }
+  return path;
+}
+
+let AC = null;
+function initAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { } }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function tone(f0, f1, dur, vol, type = 'sine', delay = 0) {
+  if (!AC || vol <= 0.0005) return;
+  const osc = AC.createOscillator(), gain = AC.createGain(), t0 = AC.currentTime + delay;
+  osc.type = type;
+  osc.frequency.setValueAtTime(f0, t0);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(gain).connect(AC.destination);
+  osc.start(t0); osc.stop(t0 + dur + 0.05);
+}
+function volAt(x, y) { return Math.max(0, 1 - Math.hypot(x - player.x, y - player.y) / 600); }
+const sfx = {
+  ping() { tone(1400, 700, 0.3, 0.22); tone(1300, 650, 0.3, 0.07, 'sine', 0.2); tone(1200, 600, 0.3, 0.025, 'sine', 0.4); },
+  click() { tone(2600, 1800, 0.05, 0.09, 'square'); tone(2400, 1700, 0.05, 0.02, 'square', 0.09); },
+  step() { tone(140, 60, 0.08, 0.14, 'triangle'); },
+  thud(v) { tone(70, 35, 0.14, 0.3 * v, 'triangle'); },
+  growl(v) { tone(80, 38, 0.7, 0.3 * v, 'sawtooth'); },
+  beat(v) { tone(65, 40, 0.12, 0.35 * v); tone(60, 38, 0.12, 0.22 * v, 'sine', 0.16); },
+  win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, f, 0.35, 0.12, 'triangle', i * 0.1)); },
+  chime() { tone(880, 880, 0.15, 0.08, 'triangle'); tone(1320, 1320, 0.2, 0.08, 'triangle', 0.1); },
+  die() { tone(320, 30, 1.2, 0.3, 'sawtooth'); tone(90, 30, 1.2, 0.3, 'square'); }
+};
+
+let state = 'title';
+let tutorial = false, level = 1, lives = MAX_LIVES, best = 1, seedSalt = 1;
+let t = 0, stateT = 0;
+let player = { x: 0, y: 0, r: 9 }, enemies = [], exitT = { tx: -1, ty: -1 };
+let parts = [], pending = [], rings = [], hearQ = [];
+let msg = '', sub = '', msgT = 0;
+let cool = 0, cool2 = 0, stepT = 0, hbT = 0, shake = 0, flash = 0;
+try { best = +localStorage.getItem('echo_best') || 1; } catch (e) { }
+function saveBest(n) {
+  if (n <= best) return;
+  best = n;
+  try { localStorage.setItem('echo_best', best); } catch (e) { }
+}
+
+function clearFx() {
+  parts = []; pending = []; rings = []; hearQ = [];
+  cool = 0; cool2 = 0; flash = 0; shake = 0;
+}
+function makeEnemy(tx, ty) {
+  return { x: mid(tx), y: mid(ty), r: 11, path: [], mode: 'wander', idle: 1 + R() * 2, stepT: R(), alert: 0, target: null, cause: '' };
+}
+function startGame() {
+  tutorial = false; level = 1; lives = MAX_LIVES;
+  startLevel(true);
+}
+function startLevel(newMaze) {
+  if (newMaze) seedSalt = Math.floor(Math.random() * 1e9);
+  R = makeRng(level * 7919 + seedSalt);
+  const n = Math.min(41, 13 + level * 4);
+  genMaze(n, n, Math.floor(n * n * 0.035));
+  player = { x: mid(1), y: mid(1), r: 9 };
+  const { dist } = bfs(1, 1);
+  let far = 0;
+  for (let i = 0; i < dist.length; i++) if (dist[i] > dist[far]) far = i;
+  exitT = { tx: far % GW, ty: (far / GW) | 0 };
+  let spots = openTiles.filter(i => dist[i] >= 12 && i !== far);
+  if (!spots.length) spots = openTiles.filter(i => dist[i] >= 4 && i !== far);
+  enemies = [];
+  const count = Math.min(level + 1, 9);
+  for (let k = 0; k < count && spots.length; k++) {
+    const i = spots.splice(Math.floor(R() * spots.length), 1)[0];
+    enemies.push(makeEnemy(i % GW, (i / GW) | 0));
+  }
+  clearFx();
+  state = 'play';
+  msg = 'LEVEL ' + level;
+  sub = level === 1 ? 'Find the gold exit. Walking is silent, noise is not.' : '';
+  msgT = 2.5;
+}
+
+const TUT_MAP = [
+  '##########################',
+  '#.....#..................#',
+  '#.....#..................#',
+  '#..P..#..........C.......#',
+  '#........................#',
+  '#.....#..................#',
+  '####################.#####',
+  '#X...................#####',
+  '##########################'
+];
+let tut = { pulses: 0, clicks: 0, run: 0, t: 0, step: 0 };
+const TUT_STEPS = [
+  { text: 'It is pitch black. Press SPACE (or tap) to send a sonar pulse and see what is around you.',
+    done: () => tut.pulses > 0 },
+  { text: 'Cyan echoes are walls. They fade, so pulse again when you need to. Walk with WASD or the arrow keys (or drag) through the gap on the right.',
+    done: () => tileOf(player.x) >= 7 },
+  { text: 'A creature lives in this room. It is blind too and hunts by SOUND. The dashed red ring shows how far your noise travels. Pulse now and watch.',
+    done: () => enemies[0].mode === 'hunt' },
+  { text: 'The red X is where it heard you. It walks to THAT spot, not to you. Walking makes no sound, so just move away. (It cannot hurt you in the tutorial.)',
+    done: () => enemies[0].mode !== 'hunt' && tut.t > 1 },
+  { text: 'Press E (or tap with two fingers) for a quiet click. It only shows walls close to you, and creatures only hear it from very near.',
+    done: () => tut.clicks > 0 },
+  { text: 'Hold SHIFT to run (or drag far). Running is fast, but every footstep is a noise. Watch the small red rings.',
+    done: () => tut.run > 1 },
+  { text: 'Last step: find the gold exit. Hint: there is a gap in the bottom wall. In the real game you get 3 lives.',
+    done: () => false }
+];
+function startTutorial() {
+  tutorial = true; level = 1; lives = MAX_LIVES;
+  tut = { pulses: 0, clicks: 0, run: 0, t: 0, step: 0 };
+  R = makeRng(42);
+  const m = loadMap(TUT_MAP);
+  player = { x: mid(m.P.tx), y: mid(m.P.ty), r: 9 };
+  exitT = m.X;
+  const e = makeEnemy(m.C.tx, m.C.ty);
+  e.harmless = true; e.harmT = 0;
+  enemies = [e];
+  clearFx();
+  state = 'play';
+  msg = 'TUTORIAL'; sub = 'Press ESC or tap SKIP to jump to the real game.'; msgT = 3;
+}
+function updateTutorial(dt) {
+  tut.t += dt;
+  const step = TUT_STEPS[tut.step];
+  if (step && step.done()) { tut.step++; tut.t = 0; sfx.chime(); }
+}
+
+function cast(ox, oy, ang, maxD) {
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  let tx = tileOf(ox), ty = tileOf(oy);
+  const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
+  const stepX = dx === 0 ? Infinity : Math.abs(TILE / dx);
+  const stepY = dy === 0 ? Infinity : Math.abs(TILE / dy);
+  let nextX = dx === 0 ? Infinity : (dx > 0 ? ((tx + 1) * TILE - ox) / dx : (ox - tx * TILE) / -dx);
+  let nextY = dy === 0 ? Infinity : (dy > 0 ? ((ty + 1) * TILE - oy) / dy : (oy - ty * TILE) / -dy);
+  let d = 0;
+  while (d < maxD) {
+    if (nextX < nextY) { d = nextX; nextX += stepX; tx += sx; }
+    else { d = nextY; nextY += stepY; ty += sy; }
+    if (d > maxD) break;
+    if (tx === exitT.tx && ty === exitT.ty) return { d, kind: EXIT };
+    if (solid(tx, ty)) return { d, kind: WALL };
+  }
+  return null;
+}
+function sonar(ox, oy, range, rays, dim) {
+  rings.push({ x: ox, y: oy, t0: t, max: range, speed: SOUND, col: COL[WALL], a: dim ? 0.12 : 0.3, w: dim ? 1 : 2 });
+  let prev = null;
+  const off = Math.random() * 0.05;
+  for (let i = 0; i <= rays; i++) {
+    const a = (i % rays) / rays * Math.PI * 2 + off;
+    const c = Math.cos(a), s = Math.sin(a);
+    const hit = cast(ox, oy, a, range);
+    let d = hit ? hit.d : range, kind = hit ? hit.kind : 0;
+    for (const e of enemies) {
+      const ex = e.x - ox, ey = e.y - oy, proj = ex * c + ey * s;
+      if (proj > 0 && proj < d) {
+        const perp = Math.abs(ex * s - ey * c);
+        if (perp < e.r) { d = proj - Math.sqrt(e.r * e.r - perp * perp); kind = FOE; }
+      }
+    }
+    if (!kind) { prev = null; continue; }
+    const p = {
+      x: ox + c * d, y: oy + s * d, at: t + d / SOUND,
+      kind: dim && kind === WALL ? DIMWALL : kind,
+      fade: (dim ? 0.45 : 1) * (1 - (d / range) * 0.6),
+      life: kind === FOE ? 1.6 : kind === EXIT ? 5 : 4.5
+    };
+    if (prev && prev.kind === p.kind && Math.hypot(prev.x - p.x, prev.y - p.y) < 26) { p.lx = prev.x; p.ly = prev.y; }
+    pending.push(p);
+    prev = p;
+  }
+}
+
+function makeNoise(x, y, radius, cause) {
+  rings.push({ x, y, t0: t, max: radius, speed: SOUND, col: RED, a: 0.4, w: 1.5, dash: true });
+  for (const e of enemies) {
+    const d = Math.hypot(e.x - x, e.y - y);
+    if (d <= radius) hearQ.push({ e, at: t + d / SOUND, x, y, cause });
+  }
+}
+function hear(h) {
+  const e = h.e;
+  if (e.mode !== 'hunt') {
+    const v = volAt(e.x, e.y);
+    sfx.growl(v);
+    if (v > 0.3) shake = Math.max(shake, 6 * v);
+  }
+  e.alert = 1.5;
+  e.mode = 'hunt'; e.cause = h.cause; e.target = { x: h.x, y: h.y };
+  e.path = findPath(tileOf(e.x), tileOf(e.y), tileOf(h.x), tileOf(h.y));
+  if (!e.path.length) { e.mode = 'search'; e.idle = 2.5; }
+}
+function emit(kind) {
+  sonar(player.x, player.y, SIGHT[kind], RAYS[kind], kind !== 'pulse');
+  makeNoise(player.x, player.y, HEAR[kind], kind);
+  if (tutorial && kind === 'pulse') tut.pulses++;
+  if (tutorial && kind === 'click') tut.clicks++;
+}
+
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  if (!e.repeat) onKey(e.code);
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+function onKey(code) {
+  initAudio();
+  if (state === 'title') {
+    if (code === 'Space' || code === 'Enter') startGame();
+    if (code === 'KeyT') startTutorial();
+    return;
+  }
+  if (state === 'over') {
+    if (code === 'Space' || code === 'Enter') startGame();
+    if (code === 'Escape') state = 'title';
+    return;
+  }
+  if (code === 'Escape' && tutorial) { startGame(); return; }
+  if (code === 'Space') action('pulse');
+  if (code === 'KeyE') action('click');
+}
+let touch = null, joy = { x: 0, y: 0 };
+cv.addEventListener('touchstart', e => {
+  e.preventDefault();
+  initAudio();
+  if (e.touches.length === 2) { action('click'); return; }
+  const p = e.touches[0];
+  touch = { x: p.clientX, y: p.clientY, t: performance.now(), moved: false };
+}, { passive: false });
+cv.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!touch) return;
+  const p = e.touches[0], dx = p.clientX - touch.x, dy = p.clientY - touch.y, m = Math.hypot(dx, dy);
+  if (m > 12) touch.moved = true;
+  joy = m > 12 ? { x: dx / Math.max(m, 60), y: dy / Math.max(m, 60) } : { x: 0, y: 0 };
+}, { passive: false });
+cv.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (touch && !touch.moved && performance.now() - touch.t < 250) tap(touch.x, touch.y);
+  if (!e.touches.length) { touch = null; joy = { x: 0, y: 0 }; }
+}, { passive: false });
+cv.addEventListener('mousedown', e => { initAudio(); tap(e.clientX, e.clientY); });
+let buttons = [];
+function tap(x, y) {
+  for (const b of buttons) {
+    if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { b.act(); return; }
+  }
+  if (state === 'play') action('pulse');
+}
+function action(kind) {
+  if (state !== 'play') return;
+  if (kind === 'pulse' && cool <= 0) { cool = 1.2; sfx.ping(); emit('pulse'); }
+  if (kind === 'click' && cool2 <= 0) { cool2 = 0.35; sfx.click(); emit('click'); }
+}
+
+function hitWall(o) {
+  const r = o.r;
+  return solid(tileOf(o.x - r), tileOf(o.y - r)) || solid(tileOf(o.x + r), tileOf(o.y - r)) ||
+    solid(tileOf(o.x - r), tileOf(o.y + r)) || solid(tileOf(o.x + r), tileOf(o.y + r));
+}
+function update(dt) {
+  for (let i = pending.length - 1; i >= 0; i--) {
+    if (pending[i].at <= t) { const p = pending[i]; p.born = t; parts.push(p); pending.splice(i, 1); }
+  }
+  parts = parts.filter(p => t - p.born < p.life);
+  rings = rings.filter(r => (t - r.t0) * r.speed < r.max);
+  msgT -= dt; shake *= 0.9; flash = Math.max(0, flash - dt);
+  if (state === 'dead' || state === 'won') {
+    stateT -= dt;
+    if (stateT <= 0) afterPause();
+    return;
+  }
+  if (state !== 'play') return;
+  cool -= dt; cool2 -= dt;
+  for (let i = hearQ.length - 1; i >= 0; i--) {
+    if (hearQ[i].at <= t) { hear(hearQ[i]); hearQ.splice(i, 1); }
+  }
+  movePlayer(dt);
+  moveEnemies(dt);
+  if (state !== 'play') return;
+  checkExit();
+  if (tutorial) updateTutorial(dt);
+}
+function movePlayer(dt) {
+  const mx = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0) + joy.x;
+  const my = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0) + joy.y;
+  const m = Math.hypot(mx, my);
+  const running = keys.ShiftLeft || keys.ShiftRight || Math.hypot(joy.x, joy.y) > 0.95;
+  if (m < 0.05) return;
+  const sp = (running ? RUN : WALK) * dt / Math.max(1, m);
+  player.x += mx * sp; if (hitWall(player)) player.x -= mx * sp;
+  player.y += my * sp; if (hitWall(player)) player.y -= my * sp;
+  if (running) {
+    if (tutorial) tut.run += dt;
+    stepT -= dt;
+    if (stepT <= 0) { stepT = 0.3; sfx.step(); emit('step'); }
+  }
+}
+function moveEnemies(dt) {
+  const huntSpeed = tutorial ? 80 : Math.min(140, 92 + level * 6);
+  let nearest = Infinity;
+  for (const e of enemies) {
+    e.alert = Math.max(0, e.alert - dt);
+    if (e.harmT) e.harmT = Math.max(0, e.harmT - dt);
+    const d = Math.hypot(e.x - player.x, e.y - player.y);
+    e.stepT -= dt;
+    if (e.stepT <= 0 && e.path.length) {
+      const hunting = e.mode === 'hunt';
+      e.stepT = hunting ? 0.45 : 1.3;
+      if (d < (hunting ? 650 : 300)) {
+        rings.push({ x: e.x, y: e.y, t0: t, max: hunting ? 55 : 35, speed: 110, col: RED, a: hunting ? 0.55 : 0.3, w: 1.5 });
+        sfx.thud(volAt(e.x, e.y) * (hunting ? 1 : 0.5));
+      }
+    }
+    if (!e.path.length) {
+      e.idle -= dt;
+      if (e.idle <= 0) {
+        e.mode = 'wander'; e.target = null; e.cause = '';
+        const ex = tileOf(e.x), ey = tileOf(e.y);
+        for (let k = 0; k < 12; k++) {
+          const i = openTiles[Math.floor(Math.random() * openTiles.length)];
+          const tx = i % GW, ty = (i / GW) | 0;
+          if (Math.abs(tx - ex) + Math.abs(ty - ey) < 9) { e.path = findPath(ex, ey, tx, ty); break; }
+        }
+        e.idle = 1 + Math.random() * 2;
+      }
+    } else {
+      const n = e.path[0], px = mid(n % GW), py = mid((n / GW) | 0);
+      const dx = px - e.x, dy = py - e.y, dd = Math.hypot(dx, dy);
+      const sp = (e.mode === 'hunt' ? huntSpeed : 45) * dt;
+      if (dd <= sp) {
+        e.x = px; e.y = py; e.path.shift();
+        if (!e.path.length && e.mode === 'hunt') { e.mode = 'search'; e.idle = 2.5; }
+      } else {
+        e.x += dx / dd * sp; e.y += dy / dd * sp;
+      }
+    }
+    nearest = Math.min(nearest, d);
+    if (d < e.r + player.r - 2) {
+      if (e.harmless) { if (!e.harmT) tutorialCaught(e); }
+      else { caught(e); return; }
+    }
+  }
+  player.danger = Math.max(0, 1 - nearest / 260);
+  if (nearest < 320) {
+    hbT -= dt;
+    if (hbT <= 0) { sfx.beat(1 - nearest / 320); hbT = 0.32 + (nearest / 320) * 0.9; }
+  }
+}
+function caught(e) {
+  lives--;
+  state = 'dead'; stateT = 2.4; flash = 1; shake = 18; sfx.die();
+  msg = { pulse: 'IT HEARD YOUR SONAR', step: 'IT HEARD YOU RUNNING', click: 'IT HEARD YOUR CLICK' }[e.cause] || 'IT BUMPED INTO YOU';
+  sub = lives > 0 ? lives + (lives === 1 ? ' life' : ' lives') + ' left' : 'No lives left';
+  msgT = 2.4;
+  for (const o of enemies) o.alert = 2.4;
+  rings.push({ x: player.x, y: player.y, t0: t, max: 400, speed: SOUND, col: RED, a: 0.5, w: 2 });
+}
+function tutorialCaught(e) {
+  flash = 0.6; shake = 8;
+  msg = 'CAUGHT'; sub = 'In the real game that costs a life. Keep going.'; msgT = 2.5;
+  e.harmT = 2; e.mode = 'wander'; e.path = []; e.idle = 2; e.target = null;
+}
+function checkExit() {
+  if (tileOf(player.x) !== exitT.tx || tileOf(player.y) !== exitT.ty) return;
+  state = 'won'; stateT = tutorial ? 2.8 : 1.8; sfx.win();
+  rings.push({ x: player.x, y: player.y, t0: t, max: 600, speed: SOUND, col: COL[EXIT], a: 0.5, w: 2 });
+  if (tutorial) { msg = 'TUTORIAL DONE'; sub = 'Now for real. 3 lives. Good luck.'; }
+  else { msg = 'ESCAPED'; sub = ''; saveBest(level + 1); }
+  msgT = stateT;
+}
+function afterPause() {
+  if (state === 'won') {
+    if (tutorial) startGame();
+    else { level++; startLevel(true); }
+  } else if (lives > 0) {
+    startLevel(false);
+  } else {
+    state = 'over';
+  }
+}
+
+function drawRings() {
+  for (const r of rings) {
+    const rad = (t - r.t0) * r.speed;
+    cx.globalAlpha = r.a * (1 - rad / r.max);
+    cx.strokeStyle = r.col; cx.lineWidth = r.w;
+    cx.setLineDash(r.dash ? [6, 6] : []);
+    cx.beginPath(); cx.arc(r.x, r.y, rad, 0, Math.PI * 2); cx.stroke();
+  }
+  cx.setLineDash([]);
+}
+function drawEchoes() {
+  cx.lineWidth = 1.2;
+  for (const p of parts) {
+    let a = p.fade * Math.pow(1 - (t - p.born) / p.life, 1.6);
+    if (p.kind === EXIT) a *= 0.7 + 0.3 * Math.sin(t * 8 + p.x);
+    if (a <= 0.01) continue;
+    cx.globalAlpha = a;
+    cx.fillStyle = cx.strokeStyle = COL[p.kind];
+    if (p.lx !== undefined) { cx.beginPath(); cx.moveTo(p.lx, p.ly); cx.lineTo(p.x, p.y); cx.stroke(); }
+    const s = p.kind === FOE ? 3 : 2;
+    cx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+  }
+}
+function drawCreatureHints() {
+  for (const e of enemies) {
+    if (e.mode === 'hunt' && e.target) {
+      const { x, y } = e.target;
+      cx.globalAlpha = 0.55 + 0.25 * Math.sin(t * 6);
+      cx.strokeStyle = RED; cx.lineWidth = 2;
+      cx.beginPath();
+      cx.moveTo(x - 7, y - 7); cx.lineTo(x + 7, y + 7);
+      cx.moveTo(x + 7, y - 7); cx.lineTo(x - 7, y + 7);
+      cx.stroke();
+    }
+    if (e.alert > 0) {
+      const a = Math.min(1, e.alert);
+      const g = cx.createRadialGradient(e.x, e.y, 0, e.x, e.y, 22);
+      g.addColorStop(0, `rgba(255,60,60,${0.9 * a})`); g.addColorStop(1, 'rgba(255,0,0,0)');
+      cx.globalAlpha = 1; cx.fillStyle = g;
+      cx.beginPath(); cx.arc(e.x, e.y, 22, 0, Math.PI * 2); cx.fill();
+      cx.globalAlpha = a; cx.fillStyle = RED;
+      cx.font = `bold 16px ${FONT}`; cx.textAlign = 'center';
+      cx.fillText('!', e.x, e.y - 18);
+    }
+  }
+}
+function drawPlayer() {
+  cx.globalAlpha = 1;
+  const g = cx.createRadialGradient(player.x, player.y, 0, player.x, player.y, 26);
+  g.addColorStop(0, 'rgba(200,255,255,0.9)');
+  g.addColorStop(0.3, 'rgba(80,220,255,0.35)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  cx.fillStyle = g;
+  cx.beginPath(); cx.arc(player.x, player.y, 26, 0, Math.PI * 2); cx.fill();
+}
+function draw() {
+  cx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx.globalCompositeOperation = 'source-over'; cx.globalAlpha = 1;
+  cx.fillStyle = '#000'; cx.fillRect(0, 0, VW, VH);
+  buttons = [];
+  if (state === 'title') { drawTitle(); return; }
+  if (state === 'over') { drawGameOver(); return; }
+  const sx = (Math.random() - 0.5) * shake, sy = (Math.random() - 0.5) * shake;
+  cx.save();
+  cx.translate(Math.round(VW / 2 - player.x + sx), Math.round(VH / 2 - player.y + sy));
+  cx.globalCompositeOperation = 'lighter';
+  drawRings();
+  drawEchoes();
+  drawCreatureHints();
+  if (state !== 'dead') drawPlayer();
+  cx.restore();
+  cx.globalCompositeOperation = 'source-over';
+  const danger = state === 'play' ? (player.danger || 0) : 0;
+  if (danger > 0 || flash > 0) {
+    const v = Math.max(danger * (0.55 + 0.15 * Math.sin(t * 10)), flash);
+    const g = cx.createRadialGradient(VW / 2, VH / 2, Math.min(VW, VH) * 0.25, VW / 2, VH / 2, Math.max(VW, VH) * 0.75);
+    g.addColorStop(0, 'rgba(255,0,30,0)');
+    g.addColorStop(1, `rgba(255,0,30,${v * 0.6})`);
+    cx.globalAlpha = 1; cx.fillStyle = g; cx.fillRect(0, 0, VW, VH);
+  }
+  drawHUD();
+}
+
+function heart(x, y, s, filled) {
+  cx.beginPath();
+  cx.moveTo(x, y + s * 0.3);
+  cx.bezierCurveTo(x, y, x - s / 2, y, x - s / 2, y + s * 0.3);
+  cx.bezierCurveTo(x - s / 2, y + s * 0.6, x, y + s * 0.8, x, y + s);
+  cx.bezierCurveTo(x, y + s * 0.8, x + s / 2, y + s * 0.6, x + s / 2, y + s * 0.3);
+  cx.bezierCurveTo(x + s / 2, y, x, y, x, y + s * 0.3);
+  if (filled) cx.fill(); else cx.stroke();
+}
+function wrap(text, maxW) {
+  const lines = []; let line = '';
+  for (const word of text.split(' ')) {
+    const test = line ? line + ' ' + word : word;
+    if (cx.measureText(test).width > maxW && line) { lines.push(line); line = word; }
+    else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function box(x, y, w, h, r) {
+  cx.beginPath();
+  if (cx.roundRect) cx.roundRect(x, y, w, h, r); else cx.rect(x, y, w, h);
+}
+function button(label, x, y, w, h, act, strong) {
+  cx.globalAlpha = 1;
+  cx.fillStyle = strong ? 'rgba(120,255,255,0.18)' : 'rgba(120,255,255,0.06)';
+  cx.strokeStyle = 'rgba(150,255,255,0.7)'; cx.lineWidth = 1.5;
+  box(x, y, w, h, 8); cx.fill(); cx.stroke();
+  cx.fillStyle = '#cff'; cx.font = `bold 15px ${FONT}`; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+  cx.fillText(label, x + w / 2, y + h / 2 + 1);
+  cx.textBaseline = 'alphabetic';
+  buttons.push({ x, y, w, h, act });
+}
+function drawHUD() {
+  cx.globalAlpha = 1; cx.globalCompositeOperation = 'source-over';
+  cx.textAlign = 'left'; cx.font = `13px ${FONT}`; cx.fillStyle = 'rgba(150,255,255,0.75)';
+  cx.fillText(tutorial ? 'TUTORIAL' : `LEVEL ${level}   BEST ${best}`, 16, 26);
+  cx.fillStyle = cx.strokeStyle = RED; cx.lineWidth = 1.5;
+  for (let i = 0; i < MAX_LIVES; i++) heart(24 + i * 22, 38, 14, i < lives);
+  const charge = 1 - Math.max(0, cool) / 1.2;
+  cx.fillStyle = 'rgba(150,255,255,0.15)'; cx.fillRect(16, 62, 120, 3);
+  cx.fillStyle = charge >= 1 ? 'rgba(150,255,255,0.9)' : 'rgba(150,255,255,0.45)';
+  cx.fillRect(16, 62, 120 * charge, 3);
+  cx.font = `11px ${FONT}`;
+  [[COL[WALL], 'wall'], [COL[EXIT], 'exit'], [RED, 'creature / noise']].forEach(([c, label], i) => {
+    cx.fillStyle = c; cx.fillRect(16, 76 + i * 15, 8, 8);
+    cx.fillStyle = 'rgba(170,255,255,0.6)'; cx.fillText(label, 30, 84 + i * 15);
+  });
+  if (msgT > 0) {
+    cx.globalAlpha = Math.min(1, msgT);
+    cx.textAlign = 'center';
+    cx.fillStyle = state === 'dead' || msg === 'CAUGHT' ? RED : state === 'won' ? COL[EXIT] : '#bff';
+    cx.font = `bold ${Math.min(28, VW / 16)}px ${FONT}`;
+    cx.fillText(msg, VW / 2, VH * 0.28);
+    cx.font = `14px ${FONT}`; cx.fillStyle = 'rgba(200,255,255,0.85)';
+    if (sub) wrap(sub, VW - 32).forEach((l, i) => cx.fillText(l, VW / 2, VH * 0.28 + 28 + i * 18));
+    cx.globalAlpha = 1;
+  }
+  if (tutorial) drawTutorialPanel();
+}
+function drawTutorialPanel() {
+  const step = TUT_STEPS[tut.step];
+  const w = Math.min(VW - 32, 620);
+  cx.font = `14px ${FONT}`;
+  const lines = wrap(step.text, w - 32);
+  const h = 44 + lines.length * 20;
+  const x = (VW - w) / 2, y = VH - h - 16;
+  cx.globalAlpha = 1;
+  cx.fillStyle = 'rgba(0,20,24,0.85)'; cx.strokeStyle = 'rgba(150,255,255,0.4)'; cx.lineWidth = 1;
+  box(x, y, w, h, 10); cx.fill(); cx.stroke();
+  cx.textAlign = 'left';
+  cx.fillStyle = COL[EXIT]; cx.font = `bold 12px ${FONT}`;
+  cx.fillText(`STEP ${tut.step + 1} OF ${TUT_STEPS.length}`, x + 16, y + 24);
+  cx.fillStyle = '#dff'; cx.font = `14px ${FONT}`;
+  lines.forEach((l, i) => cx.fillText(l, x + 16, y + 46 + i * 20));
+  button('SKIP (ESC)', VW - 136, 14, 120, 36, startGame);
+}
+function drawTitle() {
+  cx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 4; i++) {
+    const r = (t * 140 + i * 110) % 440;
+    cx.globalAlpha = 0.35 * (1 - r / 440);
+    cx.strokeStyle = COL[WALL]; cx.lineWidth = 2;
+    cx.beginPath(); cx.arc(VW / 2, VH / 2 - 40, r, 0, Math.PI * 2); cx.stroke();
+  }
+  cx.globalCompositeOperation = 'source-over'; cx.globalAlpha = 1;
+  cx.textAlign = 'center'; cx.fillStyle = '#bff';
+  cx.font = `bold ${Math.min(96, VW / 5)}px ${FONT}`;
+  cx.fillText('ECHO', VW / 2, VH / 2 - 20);
+  cx.font = `15px ${FONT}`; cx.fillStyle = 'rgba(170,255,255,0.75)';
+  wrap('You are blind. Sound is sight. Something else is listening.', VW - 32)
+    .forEach((l, i) => cx.fillText(l, VW / 2, VH / 2 + 18 + i * 20));
+  const bw = 150, gap = 16, by = VH / 2 + 64;
+  button('PLAY', VW / 2 - bw - gap / 2, by, bw, 44, startGame, true);
+  button('TUTORIAL', VW / 2 + gap / 2, by, bw, 44, startTutorial);
+  cx.textAlign = 'center'; cx.font = `12px ${FONT}`; cx.fillStyle = 'rgba(170,255,255,0.55)';
+  cx.fillText('SPACE to play  ·  T for tutorial  ·  best level ' + best, VW / 2, by + 72);
+  cx.fillText('headphones recommended', VW / 2, by + 92);
+}
+function drawGameOver() {
+  cx.textAlign = 'center';
+  cx.fillStyle = RED; cx.font = `bold ${Math.min(64, VW / 7)}px ${FONT}`;
+  cx.fillText('GAME OVER', VW / 2, VH / 2 - 40);
+  cx.fillStyle = 'rgba(200,255,255,0.85)'; cx.font = `15px ${FONT}`;
+  cx.fillText(`You reached level ${level}.  Best: ${best}`, VW / 2, VH / 2);
+  const bw = 150, gap = 16, by = VH / 2 + 30;
+  button('TRY AGAIN', VW / 2 - bw - gap / 2, by, bw, 44, startGame, true);
+  button('MENU', VW / 2 + gap / 2, by, bw, 44, () => { state = 'title'; });
+  cx.textAlign = 'center'; cx.font = `12px ${FONT}`; cx.fillStyle = 'rgba(170,255,255,0.55)';
+  cx.fillText('SPACE to try again  ·  ESC for menu', VW / 2, by + 72);
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000));
+  last = now; t += dt;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
